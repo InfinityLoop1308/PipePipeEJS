@@ -1,0 +1,326 @@
+import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
+import main, { type Input, type Output } from './src/yt/solver/main.ts';
+import { preprocessPlayer, getFromPrepared } from './src/yt/solver/solvers.ts';
+
+const app = new Application();
+const router = new Router();
+
+const PLAYER_VARIANTS: Record<string, string> = {
+  'main': 'player_ias.vflset/en_US/base.js',
+  'tcc': 'player_ias_tcc.vflset/en_US/base.js',
+  'tce': 'player_ias_tce.vflset/en_US/base.js',
+  'es5': 'player_es5.vflset/en_US/base.js',
+  'es6': 'player_es6.vflset/en_US/base.js',
+  'tv': 'tv-player-ias.vflset/tv-player-ias.js',
+  'tv_es6': 'tv-player-es6.vflset/tv-player-es6.js',
+  'phone': 'player-plasma-ias-phone-en_US.vflset/base.js',
+  'tablet': 'player-plasma-ias-tablet-en_US.vflset/base.js'
+};
+
+const cache = new Map<string, { data: string; lastAccess: number }>();
+const CACHE_DIR = '/tmp/yt_player_cache';
+const CACHE_TTL = 1000 * 60 * 60 * 24 * 14;
+
+// 预编译缓存：存储预处理后的 player 代码和函数对象
+const precompilationCache = new Map<string, {
+  preprocessed: string;
+  solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null };
+  lastAccess: number
+}>();
+const PRECOMPILATION_TTL = 1000 * 60 * 60 * 24 * 7; // 7天
+
+function getCacheKey(player: string, variant: string) {
+  return `${player}_${variant}`;
+}
+
+async function getPrecompiledCached(player: string, variant = 'main'): Promise<{ preprocessed: string; solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null } }> {
+  const key = getCacheKey(player, variant);
+  const now = Date.now();
+
+  // 检查预编译缓存
+  const cached = precompilationCache.get(key);
+  if (cached && (now - cached.lastAccess) < PRECOMPILATION_TTL) {
+    cached.lastAccess = now;
+    console.log(`Precompilation cache hit: ${key}`);
+    return {
+      preprocessed: cached.preprocessed,
+      solvers: cached.solvers
+    };
+  }
+
+  // 获取原始 player 代码
+  const playerCode = await getPlayerCached(player, variant);
+
+  // 进行预编译
+  console.log(`Precompiling player: ${key}`);
+  const preprocessed = preprocessPlayer(playerCode);
+
+  // 创建函数对象
+  const solvers = getFromPrepared(preprocessed);
+
+  // 缓存预编译结果和函数对象
+  precompilationCache.set(key, { preprocessed, solvers, lastAccess: now });
+  console.log(`Precompilation cached: ${key}`);
+
+  return {
+    preprocessed,
+    solvers
+  };
+}
+
+async function cleanExpiredCache() {
+  const now = Date.now();
+
+  // 清理原始 player 代码缓存
+  for (const [key, value] of cache.entries()) {
+    if (now - value.lastAccess > CACHE_TTL) {
+      cache.delete(key);
+      console.log(`Cleaned memory cache: ${key}`);
+    }
+  }
+
+  // 清理预编译缓存
+  for (const [key, value] of precompilationCache.entries()) {
+    if (now - value.lastAccess > PRECOMPILATION_TTL) {
+      precompilationCache.delete(key);
+      console.log(`Cleaned precompilation cache: ${key}`);
+    }
+  }
+
+  try {
+    for await (const entry of Deno.readDir(CACHE_DIR)) {
+      if (entry.isFile) {
+        const filePath = `${CACHE_DIR}/${entry.name}`;
+        try {
+          const fileInfo = await Deno.stat(filePath);
+          if (fileInfo.mtime && now - fileInfo.mtime.getTime() > CACHE_TTL) {
+            await Deno.remove(filePath);
+            console.log(`Cleaned disk cache: ${entry.name}`);
+          }
+        } catch (error) {
+          console.error(`Failed to clean file: ${entry.name}`, error);
+        }
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) {
+      console.error('Failed to clean disk cache:', error);
+    }
+  }
+}
+
+async function getPlayerCached(player: string, variant = 'main'): Promise<string> {
+  const key = getCacheKey(player, variant);
+  const now = Date.now();
+
+  const memCache = cache.get(key);
+  if (memCache && (now - memCache.lastAccess) < CACHE_TTL) {
+    memCache.lastAccess = now;
+    return memCache.data;
+  }
+
+  const diskPath = `${CACHE_DIR}/${key}.js`;
+  try {
+    const fileInfo = await Deno.stat(diskPath);
+
+    if (fileInfo.mtime && now - fileInfo.mtime.getTime() < CACHE_TTL) {
+      const data = await Deno.readTextFile(diskPath);
+      cache.set(key, { data, lastAccess: now });
+      console.log(`Loaded from disk cache: ${key}`);
+      return data;
+    } else {
+      await Deno.remove(diskPath);
+      console.log(`Disk cache expired: ${key}`);
+    }
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) {
+      console.error(`Failed to read disk cache: ${key}`, error);
+    }
+  }
+
+  const path = PLAYER_VARIANTS[variant];
+  if (!path) {
+    throw new Error(`Unknown variant: ${variant}`);
+  }
+
+  const url = `https://www.youtube.com/s/player/${player}/${path}`;
+  console.log(`Downloading player: ${key}`);
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Failed to download player: ${response.status} ${response.statusText}`);
+  }
+
+  const data = await response.text();
+
+  cache.set(key, { data, lastAccess: now });
+
+  await Deno.mkdir(CACHE_DIR, { recursive: true });
+  await Deno.writeTextFile(diskPath, data);
+  console.log(`Cache saved: ${key}`);
+
+  return data;
+}
+
+router.get('/decode', async (ctx) => {
+  try {
+    const params = ctx.request.url.searchParams;
+    const player = params.get('player');
+    const n = params.get('n');
+    const sig = params.get('sig');
+    const variant = params.get('variant') || 'main';
+
+    if (!player) {
+      ctx.response.status = 400;
+      ctx.response.body = {
+        type: "error" as const,
+        error: "Missing 'player' parameter"
+      };
+      return;
+    }
+
+    if (!n && !sig) {
+      ctx.response.status = 400;
+      ctx.response.body = {
+        type: "error" as const,
+        error: "Provide at least 'n' or 'sig' parameters"
+      };
+      return;
+    }
+
+    // 使用预编译缓存（首次会触发预编译和函数创建）
+    const { preprocessed, solvers } = await getPrecompiledCached(player, variant);
+
+    const requests: { type: "n" | "sig"; challenges: string[] }[] = [];
+    if (n && n.trim()) {
+      requests.push({
+        type: "n" as const,
+        challenges: n.split(',').map(s => s.trim()).filter(Boolean)
+      });
+    }
+    if (sig && sig.trim()) {
+      requests.push({
+        type: "sig" as const,
+        challenges: sig.split(',').map(s => s.trim()).filter(Boolean)
+      });
+    }
+
+    // 使用新的重载，直接传入预处理的字符串和缓存的solvers
+    const result: Output = main(preprocessed, solvers, requests);
+
+    ctx.response.body = result;
+  } catch (error) {
+    console.error('Decode error:', error);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      type: "error" as const,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+});
+
+router.get('/cache/status', (ctx) => {
+  const now = Date.now();
+  const entries = Array.from(cache.entries()).map(([key, value]) => ({
+    key,
+    age_hours: ((now - value.lastAccess) / (1000 * 60 * 60)).toFixed(1),
+    size_kb: (value.data.length / 1024).toFixed(1),
+    expires_in_days: ((CACHE_TTL - (now - value.lastAccess)) / (1000 * 60 * 60 * 24)).toFixed(1)
+  }));
+
+  const precompilationEntries = Array.from(precompilationCache.entries()).map(([key, value]) => ({
+    key,
+    age_hours: ((now - value.lastAccess) / (1000 * 60 * 60)).toFixed(1),
+    size_kb: (value.preprocessed.length / 1024).toFixed(1),
+    has_solvers: value.solvers ? true : false,
+    expires_in_days: ((PRECOMPILATION_TTL - (now - value.lastAccess)) / (1000 * 60 * 60 * 24)).toFixed(1)
+  }));
+
+  ctx.response.body = {
+    memory_entries: entries.length,
+    precompilation_entries: precompilationEntries.length,
+    entries,
+    precompilation: precompilationEntries,
+    cache_ttl_days: 14,
+    precompilation_ttl_days: 7,
+    cache_dir: CACHE_DIR,
+    memory_optimization: "Functions are now cached to prevent OOM"
+  };
+});
+
+router.post('/cache/clean', async (ctx) => {
+  await cleanExpiredCache();
+  ctx.response.body = { status: 'expired_cache_cleaned' };
+});
+
+router.post('/cache/clear', async (ctx) => {
+  cache.clear();
+  precompilationCache.clear();
+  try {
+    for await (const entry of Deno.readDir(CACHE_DIR)) {
+      if (entry.isFile) {
+        await Deno.remove(`${CACHE_DIR}/${entry.name}`);
+      }
+    }
+  } catch (error) {
+    // Ignore directory not found errors
+  }
+  ctx.response.body = { status: 'all_cache_cleared' };
+});
+
+router.get('/health', (ctx) => {
+  ctx.response.body = { status: 'ok', timestamp: new Date().toISOString() };
+});
+
+router.get('/variants', (ctx) => {
+  ctx.response.body = Object.keys(PLAYER_VARIANTS);
+});
+
+router.get('/warmup', async (ctx) => {
+  try {
+    const params = ctx.request.url.searchParams;
+    const player = params.get('player');
+    const variant = params.get('variant') || 'main';
+
+    if (!player) {
+      ctx.response.status = 400;
+      ctx.response.body = {
+        type: "error" as const,
+        error: "Missing 'player' parameter"
+      };
+      return;
+    }
+
+    const { preprocessed } = await getPrecompiledCached(player, variant);
+
+    ctx.response.body = {
+      status: 'warmed_up',
+      player,
+      variant,
+      preprocessed_size_kb: (preprocessed.length / 1024).toFixed(1)
+    };
+  } catch (error) {
+    console.error('Warmup error:', error);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      type: "error" as const,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+});
+
+app.use(router.routes());
+app.use(router.allowedMethods());
+
+const PORT = Number(Deno.env.get('PORT')) || 4009;
+
+console.log(`YouTube decode service started on port ${PORT}`);
+console.log(`API: http://localhost:${PORT}/decode`);
+console.log(`Cache status: http://localhost:${PORT}/cache/status`);
+console.log(`Health check: http://localhost:${PORT}/health`);
+
+setInterval(cleanExpiredCache, 1000 * 60 * 60);
+
+await cleanExpiredCache();
+
+await app.listen({ port: PORT });
