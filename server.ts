@@ -29,8 +29,46 @@ const precompilationCache = new Map<string, {
 }>();
 const PRECOMPILATION_TTL = 1000 * 60 * 60 * 24 * 7; // 7天
 
+// --- 自动更新相关 ---
+let latestPlayerId: string | null = null;
+const UPDATE_INTERVAL = 1000 * 60 * 60 * 24; // 24小时
+
 function getCacheKey(player: string, variant: string) {
   return `${player}_${variant}`;
+}
+
+// 自动获取最新 Player ID 并预热
+async function updateLatestPlayer() {
+  console.log('[AutoUpdate] Checking for new player version...');
+  try {
+    const response = await fetch("https://www.youtube.com/iframe_api");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch iframe_api: ${response.status}`);
+    }
+    const text = await response.text();
+
+    // 正则匹配: player\/([a-z0-9]{8})\/
+    const match = text.match('player\\\\/([a-z0-9]{8})\\\\/');
+
+    if (match && match[1]) {
+      const newId = match[1];
+      if (newId !== latestPlayerId) {
+        console.log(`[AutoUpdate] New player found: ${newId} (Old: ${latestPlayerId || 'none'})`);
+        latestPlayerId = newId;
+
+        // 立即预热 (默认预热 main 变体)
+        console.log(`[AutoUpdate] Warming up cache for ${newId}...`);
+        await getPrecompiledCached(newId, 'main');
+        console.log(`[AutoUpdate] Warmup complete for ${newId}`);
+      } else {
+        console.log(`[AutoUpdate] Player ID is up to date: ${latestPlayerId}`);
+      }
+    } else {
+      console.error('[AutoUpdate] Could not find player ID in iframe_api response');
+    }
+  } catch (error) {
+    console.error('[AutoUpdate] Error updating player ID:', error);
+  }
 }
 
 async function getPrecompiledCached(player: string, variant = 'main'): Promise<{ preprocessed: string; solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null } }> {
@@ -41,7 +79,7 @@ async function getPrecompiledCached(player: string, variant = 'main'): Promise<{
   const cached = precompilationCache.get(key);
   if (cached && (now - cached.lastAccess) < PRECOMPILATION_TTL) {
     cached.lastAccess = now;
-    console.log(`Precompilation cache hit: ${key}`);
+    // console.log(`Precompilation cache hit: ${key}`);
     return {
       preprocessed: cached.preprocessed,
       solvers: cached.solvers
@@ -134,6 +172,8 @@ async function getPlayerCached(player: string, variant = 'main'): Promise<string
     }
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) {
+      // debug log removed to reduce noise
+    } else {
       console.error(`Failed to read disk cache: ${key}`, error);
     }
   }
@@ -165,18 +205,23 @@ async function getPlayerCached(player: string, variant = 'main'): Promise<string
 router.get('/decode', async (ctx) => {
   try {
     const params = ctx.request.url.searchParams;
-    const player = params.get('player');
+    let player = params.get('player'); // Changed to let
     const n = params.get('n');
     const sig = params.get('sig');
     const variant = params.get('variant') || 'main';
 
+    // 如果未提供 player 参数，尝试使用自动获取的 latestPlayerId
     if (!player) {
-      ctx.response.status = 400;
-      ctx.response.body = {
-        type: "error" as const,
-        error: "Missing 'player' parameter"
-      };
-      return;
+      if (latestPlayerId) {
+        player = latestPlayerId;
+      } else {
+        ctx.response.status = 400;
+        ctx.response.body = {
+          type: "error" as const,
+          error: "Missing 'player' parameter and server hasn't fetched latest version yet."
+        };
+        return;
+      }
     }
 
     if (!n && !sig) {
@@ -208,7 +253,17 @@ router.get('/decode', async (ctx) => {
     // 使用新的重载，直接传入预处理的字符串和缓存的solvers
     const result: Output = main(preprocessed, solvers, requests);
 
-    ctx.response.body = result;
+    // 在结果中通过 meta 信息告知客户端使用了哪个 player ID
+    // Typescript might complain if Output type doesn't support extra fields, 
+    // but JS runtime will allow it. Or wrap it.
+    ctx.response.body = {
+      ...result,
+      meta: {
+        player_id: player,
+        source: params.get('player') ? 'param' : 'auto_latest'
+      }
+    };
+
   } catch (error) {
     console.error('Decode error:', error);
     ctx.response.status = 500;
@@ -237,6 +292,8 @@ router.get('/cache/status', (ctx) => {
   }));
 
   ctx.response.body = {
+    // 新增 latest_player 状态
+    latest_player_auto: latestPlayerId,
     memory_entries: entries.length,
     precompilation_entries: precompilationEntries.length,
     entries,
@@ -256,6 +313,7 @@ router.post('/cache/clean', async (ctx) => {
 router.post('/cache/clear', async (ctx) => {
   cache.clear();
   precompilationCache.clear();
+  latestPlayerId = null; // 清除自动获取的ID
   try {
     for await (const entry of Deno.readDir(CACHE_DIR)) {
       if (entry.isFile) {
@@ -268,8 +326,21 @@ router.post('/cache/clear', async (ctx) => {
   ctx.response.body = { status: 'all_cache_cleared' };
 });
 
+// 手动触发更新的接口
+router.post('/update-player', async (ctx) => {
+  await updateLatestPlayer();
+  ctx.response.body = {
+    status: 'ok',
+    latest_player: latestPlayerId
+  };
+});
+
 router.get('/health', (ctx) => {
-  ctx.response.body = { status: 'ok', timestamp: new Date().toISOString() };
+  ctx.response.body = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    latest_player: latestPlayerId
+  };
 });
 
 router.get('/variants', (ctx) => {
@@ -279,16 +350,20 @@ router.get('/variants', (ctx) => {
 router.get('/warmup', async (ctx) => {
   try {
     const params = ctx.request.url.searchParams;
-    const player = params.get('player');
+    let player = params.get('player');
     const variant = params.get('variant') || 'main';
 
     if (!player) {
-      ctx.response.status = 400;
-      ctx.response.body = {
-        type: "error" as const,
-        error: "Missing 'player' parameter"
-      };
-      return;
+      if (latestPlayerId) {
+        player = latestPlayerId;
+      } else {
+        ctx.response.status = 400;
+        ctx.response.body = {
+          type: "error" as const,
+          error: "Missing 'player' parameter"
+        };
+        return;
+      }
     }
 
     const { preprocessed } = await getPrecompiledCached(player, variant);
@@ -317,10 +392,14 @@ const PORT = Number(Deno.env.get('PORT')) || 4009;
 console.log(`YouTube decode service started on port ${PORT}`);
 console.log(`API: http://localhost:${PORT}/decode`);
 console.log(`Cache status: http://localhost:${PORT}/cache/status`);
-console.log(`Health check: http://localhost:${PORT}/health`);
 
-setInterval(cleanExpiredCache, 1000 * 60 * 60);
+// 启动定时任务
+setInterval(cleanExpiredCache, 1000 * 60 * 60); // 1小时清理一次缓存
+setInterval(updateLatestPlayer, UPDATE_INTERVAL); // 24小时更新一次Player
 
+// 启动时立即执行任务
+console.log("Initializing: Cleaning cache and fetching latest player...");
 await cleanExpiredCache();
+await updateLatestPlayer(); // 阻塞启动，直到获取到最新 ID (可选，不想阻塞可以去掉 await)
 
 await app.listen({ port: PORT });
