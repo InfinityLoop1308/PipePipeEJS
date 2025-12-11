@@ -21,10 +21,10 @@ const cache = new Map<string, { data: string; lastAccess: number }>();
 const CACHE_DIR = '/tmp/yt_player_cache';
 const CACHE_TTL = 1000 * 60 * 60 * 24 * 14;
 
-// 预编译缓存：存储预处理后的 player 代码和函数对象
+// 预编译缓存：只存储函数对象，不存储大字符串以防止内存泄漏
 const precompilationCache = new Map<string, {
-  preprocessed: string;
   solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null };
+  signatureTimestamp: number | null;
   lastAccess: number
 }>();
 const PRECOMPILATION_TTL = 1000 * 60 * 60 * 24 * 7; // 7天
@@ -35,6 +35,12 @@ const UPDATE_INTERVAL = 1000 * 60 * 60 * 24; // 24小时
 
 function getCacheKey(player: string, variant: string) {
   return `${player}_${variant}`;
+}
+
+// 从 player 代码中提取 signatureTimestamp
+function extractSignatureTimestamp(playerCode: string): number | null {
+  const match = playerCode.match(/signatureTimestamp\s*[:=]\s*(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
 }
 
 // 自动获取最新 Player ID 并预热
@@ -71,7 +77,7 @@ async function updateLatestPlayer() {
   }
 }
 
-async function getPrecompiledCached(player: string, variant = 'main'): Promise<{ preprocessed: string; solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null } }> {
+async function getPrecompiledCached(player: string, variant = 'main'): Promise<{ solvers: { n: ((val: string) => string) | null; sig: ((val: string) => string) | null }; signatureTimestamp: number | null }> {
   const key = getCacheKey(player, variant);
   const now = Date.now();
 
@@ -81,13 +87,16 @@ async function getPrecompiledCached(player: string, variant = 'main'): Promise<{
     cached.lastAccess = now;
     // console.log(`Precompilation cache hit: ${key}`);
     return {
-      preprocessed: cached.preprocessed,
-      solvers: cached.solvers
+      solvers: cached.solvers,
+      signatureTimestamp: cached.signatureTimestamp
     };
   }
 
   // 获取原始 player 代码
   const playerCode = await getPlayerCached(player, variant);
+
+  // 提取 signatureTimestamp
+  const signatureTimestamp = extractSignatureTimestamp(playerCode);
 
   // 进行预编译
   console.log(`Precompiling player: ${key}`);
@@ -96,13 +105,13 @@ async function getPrecompiledCached(player: string, variant = 'main'): Promise<{
   // 创建函数对象
   const solvers = getFromPrepared(preprocessed);
 
-  // 缓存预编译结果和函数对象
-  precompilationCache.set(key, { preprocessed, solvers, lastAccess: now });
-  console.log(`Precompilation cached: ${key}`);
+  // 只缓存函数对象，让 preprocessed 字符串（3.5MB）被 GC 回收
+  precompilationCache.set(key, { solvers, signatureTimestamp, lastAccess: now });
+  console.log(`Precompilation cached: ${key}, signatureTimestamp: ${signatureTimestamp}`);
 
   return {
-    preprocessed,
-    solvers
+    solvers,
+    signatureTimestamp
   };
 }
 
@@ -234,7 +243,7 @@ router.get('/decode', async (ctx) => {
     }
 
     // 使用预编译缓存（首次会触发预编译和函数创建）
-    const { preprocessed, solvers } = await getPrecompiledCached(player, variant);
+    const { solvers } = await getPrecompiledCached(player, variant);
 
     const requests: { type: "n" | "sig"; challenges: string[] }[] = [];
     if (n && n.trim()) {
@@ -250,8 +259,8 @@ router.get('/decode', async (ctx) => {
       });
     }
 
-    // 使用新的重载，直接传入预处理的字符串和缓存的solvers
-    const result: Output = main(preprocessed, solvers, requests);
+    // 直接使用缓存的 solvers，不再需要传入 preprocessed 字符串
+    const result: Output = main("", solvers, requests);
 
     // 在结果中通过 meta 信息告知客户端使用了哪个 player ID
     // Typescript might complain if Output type doesn't support extra fields, 
@@ -276,6 +285,8 @@ router.get('/decode', async (ctx) => {
 
 router.get('/cache/status', (ctx) => {
   const now = Date.now();
+  const memUsage = Deno.memoryUsage();
+
   const entries = Array.from(cache.entries()).map(([key, value]) => ({
     key,
     age_hours: ((now - value.lastAccess) / (1000 * 60 * 60)).toFixed(1),
@@ -286,8 +297,8 @@ router.get('/cache/status', (ctx) => {
   const precompilationEntries = Array.from(precompilationCache.entries()).map(([key, value]) => ({
     key,
     age_hours: ((now - value.lastAccess) / (1000 * 60 * 60)).toFixed(1),
-    size_kb: (value.preprocessed.length / 1024).toFixed(1),
     has_solvers: value.solvers ? true : false,
+    signatureTimestamp: value.signatureTimestamp,
     expires_in_days: ((PRECOMPILATION_TTL - (now - value.lastAccess)) / (1000 * 60 * 60 * 24)).toFixed(1)
   }));
 
@@ -301,7 +312,13 @@ router.get('/cache/status', (ctx) => {
     cache_ttl_days: 14,
     precompilation_ttl_days: 7,
     cache_dir: CACHE_DIR,
-    memory_optimization: "Functions are now cached to prevent OOM"
+    memory_optimization: "Preprocessed strings removed from cache to prevent OOM",
+    memory_usage: {
+      heap_used_mb: (memUsage.heapUsed / 1024 / 1024).toFixed(1),
+      heap_total_mb: (memUsage.heapTotal / 1024 / 1024).toFixed(1),
+      external_mb: (memUsage.external / 1024 / 1024).toFixed(1),
+      rss_mb: (memUsage.rss / 1024 / 1024).toFixed(1)
+    }
   };
 });
 
@@ -347,6 +364,35 @@ router.get('/variants', (ctx) => {
   ctx.response.body = Object.keys(PLAYER_VARIANTS);
 });
 
+router.get('/latest-player', (ctx) => {
+  const variant = ctx.request.url.searchParams.get('variant') || 'main';
+
+  if (!latestPlayerId) {
+    ctx.response.status = 404;
+    ctx.response.body = {
+      error: 'Latest player not available yet. Server is still initializing or failed to fetch.'
+    };
+    return;
+  }
+
+  const key = getCacheKey(latestPlayerId, variant);
+  const cached = precompilationCache.get(key);
+
+  if (!cached) {
+    ctx.response.status = 404;
+    ctx.response.body = {
+      error: `Player ${latestPlayerId} with variant ${variant} not cached yet. Try calling /warmup first.`
+    };
+    return;
+  }
+
+  ctx.response.body = {
+    player: latestPlayerId,
+    variant: variant,
+    signatureTimestamp: cached.signatureTimestamp
+  };
+});
+
 router.get('/warmup', async (ctx) => {
   try {
     const params = ctx.request.url.searchParams;
@@ -366,13 +412,12 @@ router.get('/warmup', async (ctx) => {
       }
     }
 
-    const { preprocessed } = await getPrecompiledCached(player, variant);
+    await getPrecompiledCached(player, variant);
 
     ctx.response.body = {
       status: 'warmed_up',
       player,
-      variant,
-      preprocessed_size_kb: (preprocessed.length / 1024).toFixed(1)
+      variant
     };
   } catch (error) {
     console.error('Warmup error:', error);
