@@ -214,23 +214,18 @@ async function getPlayerCached(player: string, variant = 'main'): Promise<string
 router.get('/decode', async (ctx) => {
   try {
     const params = ctx.request.url.searchParams;
-    let player = params.get('player'); // Changed to let
     const n = params.get('n');
     const sig = params.get('sig');
     const variant = params.get('variant') || 'main';
+    const player = latestPlayerId;
 
-    // 如果未提供 player 参数，尝试使用自动获取的 latestPlayerId
     if (!player) {
-      if (latestPlayerId) {
-        player = latestPlayerId;
-      } else {
-        ctx.response.status = 400;
-        ctx.response.body = {
-          type: "error" as const,
-          error: "Missing 'player' parameter and server hasn't fetched latest version yet."
-        };
-        return;
-      }
+      ctx.response.status = 400;
+      ctx.response.body = {
+        type: "error" as const,
+        error: "Server hasn't fetched latest player version yet."
+      };
+      return;
     }
 
     if (!n && !sig) {
@@ -269,7 +264,7 @@ router.get('/decode', async (ctx) => {
       ...result,
       meta: {
         player_id: player,
-        source: params.get('player') ? 'param' : 'auto_latest'
+        source: 'auto_latest'
       }
     };
 
