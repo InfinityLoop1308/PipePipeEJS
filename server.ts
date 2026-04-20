@@ -19,7 +19,7 @@ const PLAYER_VARIANTS: Record<string, string> = {
 
 const cache = new Map<string, { data: string; lastAccess: number }>();
 const CACHE_DIR = '/tmp/yt_player_cache';
-const CACHE_TTL = 1000 * 60 * 60 * 24 * 14;
+const CACHE_TTL = 1000 * 60 * 60 * 24 * 3;
 
 // 预编译缓存：只存储函数对象，不存储大字符串以防止内存泄漏
 const precompilationCache = new Map<string, {
@@ -27,11 +27,11 @@ const precompilationCache = new Map<string, {
   signatureTimestamp: number | null;
   lastAccess: number
 }>();
-const PRECOMPILATION_TTL = 1000 * 60 * 60 * 24 * 7; // 7天
+const PRECOMPILATION_TTL = 1000 * 60 * 60 * 24 * 3; // 7天
 
 // --- 自动更新相关 ---
 let latestPlayerId: string | null = null;
-const UPDATE_INTERVAL = 1000 * 60 * 60 * 24; // 24小时
+const UPDATE_INTERVAL = 1000 * 60 * 60 * 8; // 24小时
 
 function getCacheKey(player: string, variant: string) {
   return `${player}_${variant}`;
