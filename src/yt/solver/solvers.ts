@@ -105,7 +105,8 @@ function findInheritsHelper(statements: ESTree.Statement[]): string | null {
       node.expression.type !== "AssignmentExpression" ||
       node.expression.operator !== "=" ||
       node.expression.right.type !== "FunctionExpression" ||
-      node.expression.right.params.length !== 2
+      node.expression.right.params.length !== 2 ||
+      node.expression.right.body == null
     ) {
       continue;
     }
