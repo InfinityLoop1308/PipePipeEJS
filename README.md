@@ -1,3 +1,20 @@
+# PipePipeEJS
+
+Remote YouTube JavaScript solver service used by PipePipe, based on [yt-dlp/ejs](https://github.com/yt-dlp/ejs).
+
+Third-party projects should deploy their own instance instead of using PipePipe's public instance.
+
+## Build and run
+
+```sh
+deno compile --allow-net --allow-read --allow-write --allow-env server.ts
+./server
+```
+
+The default port is `4009`. Set the `PORT` environment variable to use a different port.
+
+---
+
 # yt-dlp-ejs
 
 External JavaScript for yt-dlp supporting many runtimes
